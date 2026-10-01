@@ -1,176 +1,316 @@
 import { useEffect, useMemo, useState } from 'react';
 import { io } from 'socket.io-client';
 
-const socket = io(import.meta.env.VITE_SOCKET_URL || 'http://localhost:5000', {
-  transports: ['websocket'],
-});
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
 
 function App() {
-  const [name, setName] = useState('');
-  const [roomCode, setRoomCode] = useState('');
+  const [token, setToken] = useState(localStorage.getItem('token') || '');
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authMode, setAuthMode] = useState('login');
+  const [form, setForm] = useState({ username: '', email: '', password: '' });
+  const [rooms, setRooms] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [selectedRoom, setSelectedRoom] = useState(null);
   const [messages, setMessages] = useState([]);
-  const [input, setInput] = useState('');
-  const [joined, setJoined] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [roomCodeInput, setRoomCodeInput] = useState('');
+  const [newRoomName, setNewRoomName] = useState('');
   const [error, setError] = useState('');
-  const [memberCount, setMemberCount] = useState(0);
-  const [hasCreatedRoom, setHasCreatedRoom] = useState(false);
+  const [socket, setSocket] = useState(null);
 
   useEffect(() => {
-    socket.on('chat-message', (msg) => {
-      setMessages((prev) => [...prev, msg]);
+    if (!token) return;
+
+    const newSocket = io(API_URL, { auth: { token } });
+    setSocket(newSocket);
+
+    newSocket.on('new-message', (message) => {
+      setMessages((prev) => {
+        const exists = prev.some((item) => item._id === message._id);
+        if (exists) return prev;
+        return [...prev, message];
+      });
     });
 
-    socket.on('system-message', (msg) => {
-      setMessages((prev) => [...prev, { sender: 'System', text: msg.text, createdAt: msg.createdAt }]);
+    newSocket.on('room-history', (payload) => {
+      setMessages(payload.messages || []);
+      setSelectedRoom((prev) => ({ ...prev, ...payload }));
     });
 
-    socket.on('room-error', (message) => {
-      setError(message);
-    });
+    return () => newSocket.disconnect();
+  }, [token]);
 
-    socket.on('room-members', ({ count }) => {
-      setMemberCount(count);
-    });
+  useEffect(() => {
+    if (!token) return;
 
-    return () => {
-      socket.off('chat-message');
-      socket.off('system-message');
-      socket.off('room-error');
-      socket.off('room-members');
-    };
-  }, []);
+    fetchCurrentUser();
+    fetchRooms();
+    fetchUsers();
+  }, [token]);
 
-  const roomCodeLabel = useMemo(() => {
-    return roomCode ? roomCode.toUpperCase() : '...';
-  }, [roomCode]);
-
-  async function createRoom() {
-    if (!name.trim()) {
-      setError('Please enter your name first.');
-      return;
+  async function fetchCurrentUser() {
+    try {
+      const response = await fetch(`${API_URL}/api/auth/me`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!response.ok) throw new Error('Auth failed');
+      const data = await response.json();
+      setCurrentUser(data.user);
+    } catch (error) {
+      logout();
     }
+  }
+
+  async function fetchRooms() {
+    try {
+      const response = await fetch(`${API_URL}/api/rooms`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await response.json();
+      setRooms(data.rooms || []);
+    } catch (error) {
+      setError('Could not load rooms');
+    }
+  }
+
+  async function fetchUsers() {
+    try {
+      const response = await fetch(`${API_URL}/api/users`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await response.json();
+      setUsers(data.users || []);
+    } catch (error) {
+      setError('Could not load users');
+    }
+  }
+
+  function logout() {
+    localStorage.removeItem('token');
+    setToken('');
+    setCurrentUser(null);
+    setRooms([]);
+    setUsers([]);
+    setMessages([]);
+    setSelectedRoom(null);
+  }
+
+  async function handleAuthSubmit(event) {
+    event.preventDefault();
+    setError('');
+
+    const endpoint = authMode === 'login' ? '/api/auth/login' : '/api/auth/signup';
+    const payload = authMode === 'login'
+      ? { email: form.email, password: form.password }
+      : { username: form.username, email: form.email, password: form.password };
 
     try {
-      const response = await fetch('http://localhost:5000/api/create-room', {
+      const response = await fetch(`${API_URL}${endpoint}`, {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
       });
 
-      if (!response.ok) {
-        throw new Error('Unable to create room');
-      }
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || 'Authentication failed');
+
+      localStorage.setItem('token', data.token);
+      setToken(data.token);
+      setForm({ username: '', email: '', password: '' });
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function createRoom() {
+    if (!newRoomName.trim()) return;
+
+    try {
+      const response = await fetch(`${API_URL}/api/rooms`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ name: newRoomName }),
+      });
 
       const data = await response.json();
-      setRoomCode(data.roomCode);
-      setError('');
-      setMessages([]);
-      setHasCreatedRoom(true);
-      setJoined(true);
-      socket.emit('join-room', { name: name.trim(), roomCode: data.roomCode });
+      if (!response.ok) throw new Error(data.message || 'Could not create room');
+
+      setNewRoomName('');
+      fetchRooms();
+      setSelectedRoom(data.room); 
+      if (socket) socket.emit('join-room', { roomId: data.room._id });
     } catch (err) {
-      setError(err.message || 'Something went wrong while creating the room');
+      setError(err.message);
     }
   }
 
   async function joinRoom() {
-    if (!name.trim()) {
-      setError('Please enter your name first.');
-      return;
-    }
-
-    const trimmedRoomCode = roomCode.trim().toUpperCase();
-
-    if (!trimmedRoomCode) {
-      setError('Please enter a room code.');
-      return;
-    }
+    if (!roomCodeInput.trim()) return;
 
     try {
-      const response = await fetch('http://localhost:5000/api/join-room', {
+      const response = await fetch(`${API_URL}/api/rooms/join`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomCode: trimmedRoomCode }),
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ code: roomCodeInput }),
       });
 
-      if (!response.ok) {
-        throw new Error('Room not found');
-      }
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || 'Could not join room');
 
-      setRoomCode(trimmedRoomCode);
-      setError('');
-      setMessages([]);
-      setHasCreatedRoom(false);
-      setJoined(true);
-      socket.emit('join-room', { name: name.trim(), roomCode: trimmedRoomCode });
+      setRoomCodeInput('');
+      fetchRooms();
+      setSelectedRoom(data.room);
+      if (socket) socket.emit('join-room', { roomId: data.room._id });
     } catch (err) {
-      setError(err.message || 'Could not join room');
+      setError(err.message);
+    }
+  }
+
+  async function openPrivateChat(targetUserId) {
+    try {
+      const response = await fetch(`${API_URL}/api/direct-chat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ targetUserId }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || 'Could not start chat');
+
+      setSelectedRoom(data.room);
+      fetchRooms();
+      if (socket) socket.emit('join-room', { roomId: data.room._id });
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function selectRoom(room) {
+    setSelectedRoom(room);
+    if (socket) socket.emit('join-room', { roomId: room._id });
+
+    try {
+      const response = await fetch(`${API_URL}/api/rooms/${room._id}/messages`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await response.json();
+      if (response.ok) setMessages(data.messages || []);
+    } catch (err) {
+      setError('Failed to load room messages');
     }
   }
 
   function sendMessage() {
-    if (!input.trim() || !roomCode) return;
-
-    socket.emit('send-message', {
-      roomCode,
-      message: input.trim(),
-    });
-
-    setInput('');
+    if (!selectedRoom || !draft.trim() || !socket) return;
+    socket.emit('send-message', { roomId: selectedRoom._id, text: draft });
+    setDraft('');
   }
+
+  const isAuthenticated = Boolean(token && currentUser);
 
   return (
     <div className="app-shell">
-      <div className="chat-card">
-        {!joined ? (
-          <div className="join-panel">
-            <h1>Chat Room</h1>
-            <p>Enter your name and a room code to continue.</p>
-
-            <label>
-              Your name
-              <input
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="John Doe"
-              />
-            </label>
-
-            <label>
-              Room code
-              <input
-                type="text"
-                value={roomCode}
-                onChange={(e) => setRoomCode(e.target.value.toUpperCase())}
-                placeholder="AB12CD"
-              />
-            </label>
-
-            {error && <p className="error-message">{error}</p>}
-
-            <div className="button-row">
-              <button onClick={joinRoom}>Join room</button>
-              <button className="secondary" onClick={createRoom}>Create room</button>
-            </div>
+      {!isAuthenticated ? (
+        <div className="auth-card">
+          <h1>ChatFlow</h1>
+          <div className="toggle-row">
+            <button className={authMode === 'login' ? 'active' : ''} onClick={() => setAuthMode('login')}>Login</button>
+            <button className={authMode === 'signup' ? 'active' : ''} onClick={() => setAuthMode('signup')}>Sign up</button>
           </div>
-        ) : (
-          <div className="chat-panel">
+
+          <form onSubmit={handleAuthSubmit} className="auth-form">
+            {authMode === 'signup' && (
+              <input
+                type="text"
+                placeholder="Username"
+                value={form.username}
+                onChange={(e) => setForm({ ...form, username: e.target.value })}
+              />
+            )}
+            <input
+              type="email"
+              placeholder="Email"
+              value={form.email}
+              onChange={(e) => setForm({ ...form, email: e.target.value })}
+            />
+            <input
+              type="password"
+              placeholder="Password"
+              value={form.password}
+              onChange={(e) => setForm({ ...form, password: e.target.value })}
+            />
+
+            {error && <p className="error">{error}</p>}
+            <button type="submit">{authMode === 'login' ? 'Login' : 'Create account'}</button>
+          </form>
+        </div>
+      ) : (
+        <div className="dashboard">
+          <aside className="sidebar">
+            <div className="profile-box">
+              <h2>{currentUser.username}</h2>
+              <p>{currentUser.email}</p>
+              <button className="secondary" onClick={logout}>Logout</button>
+            </div>
+
+            <div className="panel">
+              <h3>Group rooms</h3>
+              <div className="input-row">
+                <input
+                  placeholder="New room name"
+                  value={newRoomName}
+                  onChange={(e) => setNewRoomName(e.target.value)}
+                />
+                <button onClick={createRoom}>Create</button>
+              </div>
+              <div className="input-row">
+                <input
+                  placeholder="Room code"
+                  value={roomCodeInput}
+                  onChange={(e) => setRoomCodeInput(e.target.value.toUpperCase())}
+                />
+                <button className="secondary" onClick={joinRoom}>Join</button>
+              </div>
+            </div>
+
+            <div className="panel">
+              <h3>Users</h3>
+              <div className="user-list">
+                {users.map((user) => (
+                  <div key={user._id} className="user-item">
+                    <span>{user.username}</span>
+                    <button className="small" onClick={() => openPrivateChat(user._id)}>Chat</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </aside>
+
+          <main className="chat-panel">
             <div className="chat-header">
               <div>
-                <p className="eyebrow">Room code</p>
-                <h2>{roomCodeLabel}</h2>
+                <p className="eyebrow">Conversation</p>
+                <h2>{selectedRoom ? (selectedRoom.roomType === 'private' ? 'Private chat' : selectedRoom.name || selectedRoom.code) : 'Choose a room'}</h2>
               </div>
-
-              <div className="member-count">{memberCount} online</div>
+              {selectedRoom && selectedRoom.code && <span className="code-pill">Code: {selectedRoom.code}</span>}
             </div>
 
-            <div className="messages">
-              {messages.length === 0 ? (
-                <div className="empty-state">No messages yet. Start the conversation.</div>
+            <div className="messages-box">
+              {!selectedRoom ? (
+                <div className="empty-state">Select or create a room to begin chatting.</div>
               ) : (
-                messages.map((msg, index) => (
-                  <div key={`${msg.sender}-${index}-${msg.createdAt || index}`} className="message-bubble">
-                    <div className="sender">{msg.sender}</div>
-                    <div className="text">{msg.text}</div>
+                messages.map((message) => (
+                  <div key={message._id || `${message.sender?._id}-${message.createdAt}`} className="message-item">
+                    <strong>{message.sender?.username || 'You'}:</strong> {message.text}
                   </div>
                 ))
               )}
@@ -178,26 +318,31 @@ function App() {
 
             <div className="composer">
               <input
-                type="text"
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                placeholder="Type your message..."
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                placeholder={selectedRoom ? 'Type a message...' : 'Choose a chat first'}
+                disabled={!selectedRoom}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') sendMessage();
                 }}
               />
-              <button onClick={sendMessage}>Send</button>
+              <button onClick={sendMessage} disabled={!selectedRoom}>Send</button>
             </div>
 
-            <div className="footer-row">
-              <button className="secondary" onClick={() => setJoined(false)}>
-                Leave room
-              </button>
-              {hasCreatedRoom && <span className="info-pill">Room created</span>}
+            <div className="room-list">
+              {rooms.map((room) => (
+                <button
+                  key={room._id}
+                  className={`room-item ${selectedRoom?._id === room._id ? 'selected' : ''}`}
+                  onClick={() => selectRoom(room)}
+                >
+                  {room.roomType === 'group' ? `${room.name} (${room.code})` : room.name}
+                </button>
+              ))}
             </div>
-          </div>
-        )}
-      </div>
+          </main>
+        </div>
+      )}
     </div>
   );
 }

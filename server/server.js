@@ -1,110 +1,95 @@
 const express = require('express');
-const http = require('http');
-const cors = require('cors');
-const dotenv = require('dotenv');
+const mongoose = require('mongoose');
+const jwt = require('jsonwebtoken');
+const connectDB = require('./config/db');
+const authRoutes = require('./routes/authRoutes');
+const adminRoutes = require('./routes/adminRoutes');
+const User = require('./models/User');
+const Room = require('./models/Room');
+const Message = require('./models/Message');
 const { Server } = require('socket.io');
+const dotenv = require('dotenv');
 
 dotenv.config();
 
 const app = express();
-const server = http.createServer(app);
+const httpServer = require('http').createServer(app);
+const io = new Server(httpServer, {
+  cors: { origin: process.env.CLIENT_URL || '*', methods: ['GET', 'POST'] },
+});
 
-app.use(cors());
 app.use(express.json());
+app.use(cors({ origin: process.env.CLIENT_URL || '*', credentials: true }));
 
-const io = new Server(server, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST'],
-  },
+connectDB().catch((error) => {
+  console.error('MongoDB connection error:', error.message);
+  process.exit(1);
 });
 
-const rooms = new Map();
-
-function generateRoomCode() {
-  const code = Math.random().toString(36).slice(2, 8).toUpperCase();
-  return rooms.has(code) ? generateRoomCode() : code;
-}
-
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', message: 'Chat server is running' });
-});
-
-app.post('/api/create-room', (req, res) => {
-  const roomCode = generateRoomCode();
-  rooms.set(roomCode, new Set());
-
-  res.status(201).json({ roomCode });
-});
-
-app.post('/api/join-room', (req, res) => {
-  const { roomCode } = req.body;
-
-  if (!roomCode || !rooms.has(roomCode)) {
-    return res.status(404).json({ error: 'Room not found' });
+io.use(async (socket, next) => {
+  const token = socket.handshake.auth.token;
+  if (!token) {
+    return next();
   }
 
-  return res.status(200).json({ success: true, roomCode });
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findById(decoded.id).select('-password');
+    socket.user = user;
+    next();
+  } catch (error) {
+    next();
+  }
 });
 
 io.on('connection', (socket) => {
-  socket.on('join-room', ({ name, roomCode }) => {
-    if (!roomCode || !rooms.has(roomCode)) {
-      socket.emit('room-error', 'Invalid room code');
-      return;
-    }
+  socket.on('join-room', async ({ roomId }) => {
+    if (!roomId) return;
 
-    socket.join(roomCode);
-    socket.data.roomCode = roomCode;
-    socket.data.name = name || 'Guest';
+    socket.join(roomId.toString());
+    const room = await Room.findById(roomId).populate('members', 'username');
+    if (!room) return;
 
-    rooms.get(roomCode).add(socket.id);
-
-    io.to(roomCode).emit('system-message', {
-      text: `${socket.data.name} joined the room`,
-      createdAt: new Date(),
-    });
-
-    io.to(roomCode).emit('room-members', {
-      count: rooms.get(roomCode).size,
-    });
+    const messages = await Message.find({ roomId: room._id }).populate('sender', 'username').sort({ createdAt: 1 }).limit(50);
+    socket.emit('room-history', { roomId: room._id, roomName: room.name, roomType: room.roomType, messages });
   });
 
-  socket.on('send-message', ({ roomCode, message }) => {
-    if (!roomCode || !message || !socket.data.name) {
-      return;
-    }
+  socket.on('send-message', async ({ roomId, text }) => {
+    if (!socket.user || !roomId || !text || !text.trim()) return;
 
-    io.to(roomCode).emit('chat-message', {
-      sender: socket.data.name,
-      text: message,
-      createdAt: new Date(),
+    const room = await Room.findById(roomId);
+    if (!room) return;
+
+    const message = await Message.create({
+      roomId: room._id,
+      sender: socket.user._id,
+      text: text.trim(),
+    });
+
+    const populated = await message.populate('sender', 'username email');
+    io.to(roomId.toString()).emit('new-message', {
+      _id: populated._id,
+      roomId: populated.roomId,
+      sender: { _id: populated.sender._id, username: populated.sender.username },
+      text: populated.text,
+      createdAt: populated.createdAt,
     });
   });
 
   socket.on('disconnect', () => {
-    const roomCode = socket.data.roomCode;
-
-    if (roomCode && rooms.has(roomCode)) {
-      rooms.get(roomCode).delete(socket.id);
-
-      if (rooms.get(roomCode).size === 0) {
-        rooms.delete(roomCode);
-      } else {
-        io.to(roomCode).emit('room-members', {
-          count: rooms.get(roomCode).size,
-        });
-
-        io.to(roomCode).emit('system-message', {
-          text: `${socket.data.name || 'A user'} left the room`,
-          createdAt: new Date(),
-        });
-      }
-    }
+    // no-op reserved for future cleanup
   });
 });
 
+app.use('/api/auth', authRoutes);
+app.use('/api', require('./routes/roomRoutes'));
+app.use('/api/admin', adminRoutes);
+
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-  console.log(`Chat server running on http://localhost:${PORT}`);
+httpServer.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
 });
